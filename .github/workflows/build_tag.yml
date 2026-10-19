@@ -64,7 +64,8 @@ jobs:
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           token: ${{ github.token }}
-          make_latest: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          make_latest: ${{ !contains(github.ref_name, '-') }}
           generate_release_notes: true
           body: |
             Container image: `ghcr.io/stefanoghinelli/configmap-reload@${{ needs.build-and-push.outputs.digest }}`
