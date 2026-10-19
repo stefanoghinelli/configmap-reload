@@ -1,8 +1,6 @@
-name: build-and-push-tag-and-main
+name: build-and-push-tag
 on:
   push:
-    branches:
-      - main
     tags:
       - v*
 
@@ -46,7 +44,7 @@ jobs:
           image=ghcr.io/stefanoghinelli/configmap-reload
           docker buildx build \
             --platform linux/arm64/v8,linux/amd64,linux/arm,linux/ppc64le,linux/s390x \
-            -t "$image:${{ github.ref_name == 'main' && 'dev' || github.ref_name }}" \
+            -t "$image:${{ github.ref_name }}" \
             --metadata-file build-metadata.json \
             --push \
             .

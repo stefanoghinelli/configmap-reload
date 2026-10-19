@@ -16,7 +16,7 @@ Use `ghcr.io/stefanoghinelli/configmap-reload:<version>` for a tagged release.
 Push a `v*` tag in this fork after the change is merged into `main`. The release
 workflow tests the code, publishes a multi-architecture image to the fork's
 GitHub Container Registry, verifies its digest, and creates a GitHub Release
-containing the immutable image reference. Pushes to `main` publish the `dev` tag.
+containing the immutable image reference. Pushes to `main` do not publish images.
 
 ### Usage
 
