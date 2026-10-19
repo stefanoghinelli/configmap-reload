@@ -40,6 +40,12 @@ Usage of ./out/configmap-reload:
         the url to send a request to when the specified config map volume directory has been updated
 ```
 
+Webhook URLs must use `http` or `https` and include a host. The HTTP method,
+expected status code, retry count, and request timeout are validated at startup.
+Metrics use `webhook="0"`, `webhook="1"`, and so on in the order of the
+`-webhook-url` flags. URLs are omitted from metrics and logs because they may
+contain credentials or tokens.
+
 ### License
 
 This project is [Apache Licensed](LICENSE.txt)

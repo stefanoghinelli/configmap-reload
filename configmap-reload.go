@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	fsnotify "github.com/fsnotify/fsnotify"
@@ -87,11 +88,12 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
-	if *webhookRetries < 1 {
-		log.Fatal("webhook-retries must be at least 1")
+	if err := validateRequestOptions(*webhookMethod, *webhookStatusCode, *webhookRetries, *webhookTimeout); err != nil {
+		log.Fatal(err)
 	}
-	if *webhookTimeout <= 0 {
-		log.Fatal("webhook-timeout must be greater than zero")
+	webhookURLs, err := parseWebhooks(webhook)
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	watcher, err := fsnotify.NewWatcher()
@@ -110,7 +112,7 @@ func main() {
 
 	updates := make(chan struct{}, 1)
 	go watchEvents(watcher.Events, watcher.Errors, updates)
-	go processUpdates(updates, &http.Client{Timeout: *webhookTimeout}, webhook, *webhookMethod, *webhookStatusCode, *webhookRetries, 10*time.Second)
+	go processUpdates(updates, &http.Client{Timeout: *webhookTimeout}, webhookURLs, *webhookMethod, *webhookStatusCode, *webhookRetries, 10*time.Second)
 
 	log.Fatal(serverMetrics(*listenAddress, *metricPath))
 }
@@ -143,20 +145,20 @@ func watchEvents(events <-chan fsnotify.Event, errors <-chan error, updates chan
 	}
 }
 
-func processUpdates(updates <-chan struct{}, client *http.Client, webhooks webhookFlag, method string, expectedStatus, retries int, retryDelay time.Duration) {
+func processUpdates(updates <-chan struct{}, client *http.Client, webhooks []*url.URL, method string, expectedStatus, retries int, retryDelay time.Duration) {
 	for range updates {
-		for _, h := range webhooks {
-			triggerReload(client, h, method, expectedStatus, retries, retryDelay)
+		for i, h := range webhooks {
+			triggerReload(client, h, strconv.Itoa(i), method, expectedStatus, retries, retryDelay)
 		}
 	}
 }
 
-func triggerReload(client *http.Client, h *url.URL, method string, expectedStatus, retries int, retryDelay time.Duration) {
+func triggerReload(client *http.Client, h *url.URL, label, method string, expectedStatus, retries int, retryDelay time.Duration) {
 	begun := time.Now()
 	req, err := http.NewRequest(method, h.String(), nil)
 	if err != nil {
-		setFailureMetrics(h.Redacted(), "client_request_create")
-		log.Println("error:", err)
+		setFailureMetrics(label, "client_request_create")
+		log.Println("error: could not create webhook request")
 		return
 	}
 	if h.User != nil {
@@ -169,24 +171,24 @@ func triggerReload(client *http.Client, h *url.URL, method string, expectedStatu
 		log.Printf("performing webhook request (%d/%d)", attempt, retries)
 		resp, err := client.Do(req)
 		if err != nil {
-			setFailureMetrics(h.Redacted(), "client_request_do")
-			log.Println("error:", err)
+			setFailureMetrics(label, "client_request_do")
+			log.Printf("error: webhook request failed (%T)", err)
 		} else {
 			resp.Body.Close()
-			requestsByStatusCode.WithLabelValues(h.Redacted(), strconv.Itoa(resp.StatusCode)).Inc()
+			requestsByStatusCode.WithLabelValues(label, strconv.Itoa(resp.StatusCode)).Inc()
 			if resp.StatusCode == expectedStatus {
-				setSuccessMetrics(h.Redacted(), begun)
+				setSuccessMetrics(label, begun)
 				log.Println("successfully triggered reload")
 				return
 			}
-			setFailureMetrics(h.Redacted(), "client_response")
+			setFailureMetrics(label, "client_response")
 			log.Println("error:", "Received response code", resp.StatusCode, ", expected", expectedStatus)
 		}
 		if attempt < retries {
 			time.Sleep(retryDelay)
 		}
 	}
-	setFailureMetrics(h.Redacted(), "retries_exhausted")
+	setFailureMetrics(label, "retries_exhausted")
 	log.Println("error:", "Webhook reload retries exhausted")
 }
 
@@ -229,7 +231,7 @@ func serverMetrics(listenAddress, metricsPath string) error {
 
 type volumeDirsFlag []string
 
-type webhookFlag []*url.URL
+type webhookFlag []string
 
 func (v *volumeDirsFlag) Set(value string) error {
 	*v = append(*v, value)
@@ -241,14 +243,41 @@ func (v *volumeDirsFlag) String() string {
 }
 
 func (v *webhookFlag) Set(value string) error {
-	u, err := url.Parse(value)
-	if err != nil {
-		return fmt.Errorf("invalid URL: %v", err)
-	}
-	*v = append(*v, u)
+	*v = append(*v, value)
 	return nil
 }
 
 func (v *webhookFlag) String() string {
-	return fmt.Sprint(*v)
+	return fmt.Sprintf("%d configured", len(*v))
+}
+
+func parseWebhooks(values webhookFlag) ([]*url.URL, error) {
+	webhooks := make([]*url.URL, 0, len(values))
+	for i, value := range values {
+		u, err := url.Parse(value)
+		if err != nil || u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.Fragment != "" {
+			return nil, fmt.Errorf("webhook-url %d must be an absolute HTTP(S) URL without a fragment", i+1)
+		}
+		webhooks = append(webhooks, u)
+	}
+	return webhooks, nil
+}
+
+func validateRequestOptions(method string, status, retries int, timeout time.Duration) error {
+	if strings.TrimSpace(method) != method || method == "" {
+		return fmt.Errorf("webhook-method must be a valid HTTP method")
+	}
+	if _, err := http.NewRequest(method, "http://example.invalid/", nil); err != nil {
+		return fmt.Errorf("webhook-method must be a valid HTTP method")
+	}
+	if status < 100 || status > 599 {
+		return fmt.Errorf("webhook-status-code must be between 100 and 599")
+	}
+	if retries < 1 {
+		return fmt.Errorf("webhook-retries must be at least 1")
+	}
+	if timeout <= 0 {
+		return fmt.Errorf("webhook-timeout must be greater than zero")
+	}
+	return nil
 }
