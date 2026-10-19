@@ -4,7 +4,8 @@ on:
     branches:
       - main
 
-permissions: read-all
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -12,6 +13,12 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Test and vet
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src \
+            golang:1.27.2@sha256:820153096fda4de6ac1b7194d12e416b7dd8f4e9a33d17e0345b111b945162d8 \
+            sh -c 'go test ./... && go vet ./...'
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
@@ -23,5 +30,5 @@ jobs:
         run: |
           docker buildx build \
             --platform linux/arm64/v8,linux/amd64,linux/arm,linux/ppc64le,linux/s390x \
-            -t ghcr.io/jimmidyson/configmap-reload:${{ github.event.pull_request.head.sha }} \
+            -t ghcr.io/stefanoghinelli/configmap-reload:${{ github.event.pull_request.head.sha }} \
             .

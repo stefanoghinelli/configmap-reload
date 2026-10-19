@@ -20,9 +20,9 @@ export CGO_ENABLED := 0
 
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
-ORG := github.com/jimmidyson
+ORG := github.com/stefanoghinelli
 REPOPATH ?= $(ORG)/configmap-reload
-DOCKER_IMAGE_NAME ?= ghcr.io/jimmidyson/configmap-reload
+DOCKER_IMAGE_NAME ?= ghcr.io/stefanoghinelli/configmap-reload
 DOCKER_IMAGE_TAG ?= latest
 
 LDFLAGS := -s -w -extldflags '-static'
