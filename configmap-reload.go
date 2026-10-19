@@ -24,6 +24,7 @@ var (
 	webhookMethod     = flag.String("webhook-method", "POST", "the HTTP method url to use to send the webhook")
 	webhookStatusCode = flag.Int("webhook-status-code", 200, "the HTTP status code indicating successful triggering of reload")
 	webhookRetries    = flag.Int("webhook-retries", 1, "the amount of times to retry the webhook reload request")
+	webhookTimeout    = flag.Duration("webhook-timeout", 10*time.Second, "maximum duration of each webhook request")
 	listenAddress     = flag.String("web.listen-address", ":9533", "Address to listen on for web interface and telemetry.")
 	metricPath        = flag.String("web.telemetry-path", "/metrics", "Path under which to expose metrics.")
 
@@ -86,73 +87,18 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
+	if *webhookRetries < 1 {
+		log.Fatal("webhook-retries must be at least 1")
+	}
+	if *webhookTimeout <= 0 {
+		log.Fatal("webhook-timeout must be greater than zero")
+	}
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer watcher.Close()
-
-	go func() {
-		for {
-			select {
-			case event := <-watcher.Events:
-				if !isValidEvent(event) {
-					continue
-				}
-				log.Println("config map updated")
-				for _, h := range webhook {
-					begun := time.Now()
-					req, err := http.NewRequest(*webhookMethod, h.String(), nil)
-					if err != nil {
-						setFailureMetrics(h.Redacted(), "client_request_create")
-						log.Println("error:", err)
-						continue
-					}
-					userInfo := h.User
-					if userInfo != nil {
-						if password, passwordSet := userInfo.Password(); passwordSet {
-							req.SetBasicAuth(userInfo.Username(), password)
-						}
-					}
-
-					successfulReloadWebhook := false
-
-					for retries := *webhookRetries; retries != 0; retries-- {
-						log.Printf("performing webhook request (%d/%d)", retries, *webhookRetries)
-						resp, err := http.DefaultClient.Do(req)
-						if err != nil {
-							setFailureMetrics(h.Redacted(), "client_request_do")
-							log.Println("error:", err)
-							time.Sleep(time.Second * 10)
-							continue
-						}
-						resp.Body.Close()
-						requestsByStatusCode.WithLabelValues(h.Redacted(), strconv.Itoa(resp.StatusCode)).Inc()
-						if resp.StatusCode != *webhookStatusCode {
-							setFailureMetrics(h.Redacted(), "client_response")
-							log.Println("error:", "Received response code", resp.StatusCode, ", expected", *webhookStatusCode)
-							time.Sleep(time.Second * 10)
-							continue
-						}
-
-						setSuccessMetrics(h.Redacted(), begun)
-						log.Println("successfully triggered reload")
-						successfulReloadWebhook = true
-						break
-					}
-
-					if !successfulReloadWebhook {
-						setFailureMetrics(h.Redacted(), "retries_exhausted")
-						log.Println("error:", "Webhook reload retries exhausted")
-					}
-				}
-			case err := <-watcher.Errors:
-				watcherErrors.Inc()
-				log.Println("error:", err)
-			}
-		}
-	}()
 
 	for _, d := range volumeDirs {
 		log.Printf("Watching directory: %q", d)
@@ -162,7 +108,86 @@ func main() {
 		}
 	}
 
+	updates := make(chan struct{}, 1)
+	go watchEvents(watcher.Events, watcher.Errors, updates)
+	go processUpdates(updates, &http.Client{Timeout: *webhookTimeout}, webhook, *webhookMethod, *webhookStatusCode, *webhookRetries, 10*time.Second)
+
 	log.Fatal(serverMetrics(*listenAddress, *metricPath))
+}
+
+func watchEvents(events <-chan fsnotify.Event, errors <-chan error, updates chan<- struct{}) {
+	defer close(updates)
+	for events != nil || errors != nil {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				events = nil
+				continue
+			}
+			if !isValidEvent(event) {
+				continue
+			}
+			log.Println("config map updated")
+			select {
+			case updates <- struct{}{}:
+			default: // A reload is already pending; one follow-up reload is enough.
+			}
+		case err, ok := <-errors:
+			if !ok {
+				errors = nil
+				continue
+			}
+			watcherErrors.Inc()
+			log.Println("error:", err)
+		}
+	}
+}
+
+func processUpdates(updates <-chan struct{}, client *http.Client, webhooks webhookFlag, method string, expectedStatus, retries int, retryDelay time.Duration) {
+	for range updates {
+		for _, h := range webhooks {
+			triggerReload(client, h, method, expectedStatus, retries, retryDelay)
+		}
+	}
+}
+
+func triggerReload(client *http.Client, h *url.URL, method string, expectedStatus, retries int, retryDelay time.Duration) {
+	begun := time.Now()
+	req, err := http.NewRequest(method, h.String(), nil)
+	if err != nil {
+		setFailureMetrics(h.Redacted(), "client_request_create")
+		log.Println("error:", err)
+		return
+	}
+	if h.User != nil {
+		if password, passwordSet := h.User.Password(); passwordSet {
+			req.SetBasicAuth(h.User.Username(), password)
+		}
+	}
+
+	for attempt := 1; attempt <= retries; attempt++ {
+		log.Printf("performing webhook request (%d/%d)", attempt, retries)
+		resp, err := client.Do(req)
+		if err != nil {
+			setFailureMetrics(h.Redacted(), "client_request_do")
+			log.Println("error:", err)
+		} else {
+			resp.Body.Close()
+			requestsByStatusCode.WithLabelValues(h.Redacted(), strconv.Itoa(resp.StatusCode)).Inc()
+			if resp.StatusCode == expectedStatus {
+				setSuccessMetrics(h.Redacted(), begun)
+				log.Println("successfully triggered reload")
+				return
+			}
+			setFailureMetrics(h.Redacted(), "client_response")
+			log.Println("error:", "Received response code", resp.StatusCode, ", expected", expectedStatus)
+		}
+		if attempt < retries {
+			time.Sleep(retryDelay)
+		}
+	}
+	setFailureMetrics(h.Redacted(), "retries_exhausted")
+	log.Println("error:", "Webhook reload retries exhausted")
 }
 
 func setFailureMetrics(h, reason string) {
