@@ -1,6 +1,9 @@
 package main
 
 import (
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"log"
@@ -10,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	fsnotify "github.com/fsnotify/fsnotify"
@@ -26,6 +30,9 @@ var (
 	webhookStatusCode = flag.Int("webhook-status-code", 200, "the HTTP status code indicating successful triggering of reload")
 	webhookRetries    = flag.Int("webhook-retries", 1, "the amount of times to retry the webhook reload request")
 	webhookTimeout    = flag.Duration("webhook-timeout", 10*time.Second, "maximum duration of each webhook request")
+	webhookCAFile     = flag.String("webhook-ca-file", "", "PEM CA certificate file for HTTPS webhook requests")
+	webhookCertFile   = flag.String("webhook-client-cert-file", "", "PEM client certificate file for HTTPS webhook requests")
+	webhookKeyFile    = flag.String("webhook-client-key-file", "", "PEM client key file for HTTPS webhook requests")
 	listenAddress     = flag.String("web.listen-address", ":9533", "Address to listen on for web interface and telemetry.")
 	metricPath        = flag.String("web.telemetry-path", "/metrics", "Path under which to expose metrics.")
 
@@ -95,6 +102,12 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	client, err := newWebhookClient(*webhookTimeout, webhookTLSOptions{
+		caFile: *webhookCAFile, certFile: *webhookCertFile, keyFile: *webhookKeyFile,
+	}, webhookURLs)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -112,7 +125,7 @@ func main() {
 
 	updates := make(chan struct{}, 1)
 	go watchEvents(watcher.Events, watcher.Errors, updates)
-	go processUpdates(updates, &http.Client{Timeout: *webhookTimeout}, webhookURLs, *webhookMethod, *webhookStatusCode, *webhookRetries, 10*time.Second)
+	go processUpdates(updates, client, webhookURLs, *webhookMethod, *webhookStatusCode, *webhookRetries, 10*time.Second)
 
 	log.Fatal(serverMetrics(*listenAddress, *metricPath))
 }
@@ -280,4 +293,142 @@ func validateRequestOptions(method string, status, retries int, timeout time.Dur
 		return fmt.Errorf("webhook-timeout must be greater than zero")
 	}
 	return nil
+}
+
+type webhookTLSOptions struct {
+	caFile   string
+	certFile string
+	keyFile  string
+}
+
+func (o webhookTLSOptions) enabled() bool {
+	return o.caFile != "" || o.certFile != "" || o.keyFile != ""
+}
+
+func newWebhookClient(timeout time.Duration, options webhookTLSOptions, webhooks []*url.URL) (*http.Client, error) {
+	if !options.enabled() {
+		return &http.Client{Timeout: timeout}, nil
+	}
+	if (options.certFile == "") != (options.keyFile == "") {
+		return nil, fmt.Errorf("webhook client certificate and key files must be configured together")
+	}
+	for i, webhook := range webhooks {
+		if webhook.Scheme != "https" {
+			return nil, fmt.Errorf("webhook-url %d must use HTTPS when webhook TLS files are configured", i+1)
+		}
+	}
+
+	material, err := readWebhookTLSMaterial(options)
+	if err != nil {
+		return nil, err
+	}
+	tlsConfig, err := material.config()
+	if err != nil {
+		return nil, err
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = tlsConfig
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &reloadingWebhookTLSTransport{
+			options: options, fingerprint: material.fingerprint, transport: transport,
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 || req.URL.Scheme != "https" || req.URL.Host != via[0].URL.Host {
+				return fmt.Errorf("webhook TLS redirect must stay on the same HTTPS endpoint")
+			}
+			return nil
+		},
+	}, nil
+}
+
+type webhookTLSMaterial struct {
+	caPEM       []byte
+	certPEM     []byte
+	keyPEM      []byte
+	fingerprint [sha256.Size]byte
+}
+
+func readWebhookTLSMaterial(options webhookTLSOptions) (webhookTLSMaterial, error) {
+	var material webhookTLSMaterial
+	var err error
+	if options.caFile != "" {
+		material.caPEM, err = os.ReadFile(options.caFile)
+		if err != nil {
+			return material, fmt.Errorf("read webhook CA file: %w", err)
+		}
+	}
+	if options.certFile != "" {
+		material.certPEM, err = os.ReadFile(options.certFile)
+		if err != nil {
+			return material, fmt.Errorf("read webhook client certificate file: %w", err)
+		}
+		material.keyPEM, err = os.ReadFile(options.keyFile)
+		if err != nil {
+			return material, fmt.Errorf("read webhook client key file: %w", err)
+		}
+	}
+	hash := sha256.New()
+	for _, part := range [][]byte{material.caPEM, material.certPEM, material.keyPEM} {
+		fmt.Fprintf(hash, "%d:", len(part))
+		hash.Write(part)
+	}
+	copy(material.fingerprint[:], hash.Sum(nil))
+	return material, nil
+}
+
+func (m webhookTLSMaterial) config() (*tls.Config, error) {
+	config := &tls.Config{MinVersion: tls.VersionTLS12}
+	if m.caPEM != nil {
+		roots, err := x509.SystemCertPool()
+		if err != nil || roots == nil {
+			roots = x509.NewCertPool()
+		}
+		if !roots.AppendCertsFromPEM(m.caPEM) {
+			return nil, fmt.Errorf("webhook CA file contains no valid PEM certificates")
+		}
+		config.RootCAs = roots
+	}
+	if m.certPEM != nil {
+		certificate, err := tls.X509KeyPair(m.certPEM, m.keyPEM)
+		if err != nil {
+			return nil, fmt.Errorf("invalid webhook client certificate or key: %w", err)
+		}
+		config.Certificates = []tls.Certificate{certificate}
+	}
+	return config, nil
+}
+
+type reloadingWebhookTLSTransport struct {
+	options     webhookTLSOptions
+	mu          sync.Mutex
+	fingerprint [sha256.Size]byte
+	transport   *http.Transport
+}
+
+func (t *reloadingWebhookTLSTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Scheme != "https" {
+		return nil, fmt.Errorf("webhook TLS requires HTTPS")
+	}
+	material, err := readWebhookTLSMaterial(t.options)
+	if err != nil {
+		return nil, err
+	}
+	t.mu.Lock()
+	if material.fingerprint != t.fingerprint {
+		config, err := material.config()
+		if err != nil {
+			t.mu.Unlock()
+			return nil, err
+		}
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.TLSClientConfig = config
+		old := t.transport
+		t.transport = transport
+		t.fingerprint = material.fingerprint
+		old.CloseIdleConnections()
+	}
+	transport := t.transport
+	t.mu.Unlock()
+	return transport.RoundTrip(req)
 }
